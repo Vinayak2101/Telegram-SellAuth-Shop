@@ -1,128 +1,178 @@
-from flask import Flask, request
-from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Dispatcher, CommandHandler, CallbackQueryHandler, ConversationHandler, MessageHandler, Filters
 import requests
+import json
+import time
+import threading
+from dotenv import load_dotenv
 import os
+from database import save_transaction, update_transaction_status, get_transaction
+from payments import fetch_sellauth_products, generate_sellauth_checkout, check_sellauth_transaction_status
 
-# === CONFIGURATION ===
-BOT_TOKEN = 'YOUR_BOT_TOKEN_HERE'
-SELLAUTH_API_KEY = 'YOUR_SELLAUTH_API_KEY_HERE'
-SHOP_ID = 'YOUR_SHOP_ID_HERE'
+load_dotenv()
 
-bot = Bot(token=BOT_TOKEN)
-app = Flask(__name__)
-dispatcher = Dispatcher(bot=bot, update_queue=None, workers=0, use_context=True)
+TOKEN = os.getenv("TELEGRAM_TOKEN")
+BASE_URL = f"https://api.telegram.org/bot{TOKEN}/"
 
-# === STATES ===
-SELECT_PRODUCT, SELECT_PAYMENT, WAIT_PAYMENT = range(3)
+PRODUCTS = {}
+PAYMENT_METHODS = ["BTC", "LTC", "PAYPAL", "STRIPE", "SQUARE", "CASHAPP", "VENMO", "PAYPALFF", "AMAZONPS", "SUMUP", "MOLLIE", "SKRILL", "AUTHORIZENET", "LEMONSQUEEZY"]
+PENDING_PURCHASES = {}
 
-# === COMMAND: /start ===
-def start(update, context):
-    user = update.message.from_user
-    response = requests.get(f"https://api.sellauth.com/v1/shops/{SHOP_ID}/products", headers={"Authorization": f"Bearer {SELLAUTH_API_KEY}"})
-    products = response.json().get('data', [])
+def send_message(chat_id, text, reply_markup=None):
+    url = f"{BASE_URL}sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    requests.post(url, json=payload)
 
-    if not products:
-        update.message.reply_text("No products found.")
-        return ConversationHandler.END
+def edit_message(chat_id, message_id, text, reply_markup=None):
+    url = f"{BASE_URL}editMessageText"
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "Markdown"
+    }
+    if reply_markup:
+        payload["reply_markup"] = json.dumps(reply_markup)
+    requests.post(url, json=payload)
 
-    keyboard = [[InlineKeyboardButton(product['name'], callback_data=f"product_{product['id']}")] for product in products]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    update.message.reply_text("Select a product to buy:", reply_markup=reply_markup)
-    return SELECT_PRODUCT
+def handle_update(update):
+    if "message" in update and "text" in update["message"]:
+        chat_id = update["message"]["chat"]["id"]
+        text = update["message"]["text"]
+        user_id = update["message"]["from"]["id"]
 
-# === HANDLE PRODUCT SELECTION ===
-def handle_product_selection(update, context):
-    query = update.callback_query
-    query.answer()
-    product_id = query.data.split('_')[1]
-    context.user_data['product_id'] = product_id
+        if text == "/start":
+            if not PRODUCTS:
+                send_message(chat_id, "No products available. Contact support.")
+                return
+            keyboard = {"inline_keyboard": [[{"text": name, "callback_data": f"purchase_{name}"}] for name in PRODUCTS.keys()]}
+            send_message(chat_id, "Welcome to KeyShopBot! Choose a product:", keyboard)
 
-    keyboard = [
-        [InlineKeyboardButton("Bitcoin", callback_data="pay_btc")],
-        [InlineKeyboardButton("Litecoin", callback_data="pay_ltc")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    query.edit_message_text("Choose your payment method:", reply_markup=reply_markup)
-    return SELECT_PAYMENT
+        elif "@" in text and "." in text and user_id in PENDING_PURCHASES:  # Handle email input
+            try:
+                email = text.strip()
+                print(f"Received email: {email} for user {user_id}")
+                purchase = PENDING_PURCHASES.pop(user_id)
+                product_name, variant_id, currency = purchase["product_name"], purchase["variant_id"], purchase["currency"]
+                product = PRODUCTS.get(product_name)
+                if not product:
+                    send_message(chat_id, f"Product '{product_name}' not found!")
+                    return
+                checkout_response = generate_sellauth_checkout(
+                    product_id=product["id"],
+                    variant_id=variant_id,
+                    quantity=1,
+                    gateway=currency,
+                    email=email
+                )
+                invoice_url = checkout_response.get("invoice_url")
+                variant_name = next((v["name"] for v in product["variants"] if str(v["id"]) == variant_id), "Unknown")
+                message = (
+                    f"Payment initiated for {product_name} ({variant_name}) via {currency}.\n"
+                    f"Please complete the payment here: [Invoice Link]({invoice_url})\n"
+                    f"Invoice sent to `{email}`.\nYou’ll receive confirmation via email once paid."
+                )
+                send_message(chat_id, message)
+                # No txid, so no polling; rely on Sellauth email confirmation
+            except Exception as e:
+                print(f"Error processing purchase: {str(e)}")
+                send_message(chat_id, f"Payment setup failed: {str(e)}")
+        elif user_id in PENDING_PURCHASES:
+            send_message(chat_id, "Please enter a valid email address (e.g., your_email@gmail.com).")
 
-# === HANDLE PAYMENT METHOD SELECTION ===
-def handle_payment_selection(update, context):
-    query = update.callback_query
-    query.answer()
-    payment_method = query.data.split('_')[1]
-    product_id = context.user_data['product_id']
+    elif "callback_query" in update:
+        query = update["callback_query"]
+        chat_id = query["message"]["chat"]["id"]
+        message_id = query["message"]["message_id"]
+        data = query["data"]
+        user_id = query["from"]["id"]
 
-    # Create invoice using SellAuth API
-    invoice_response = requests.post(
-        f"https://api.sellauth.com/v1/shops/{SHOP_ID}/invoices",
-        headers={"Authorization": f"Bearer {SELLAUTH_API_KEY}"},
-        json={"product_id": product_id, "payment_method": payment_method}
-    )
-    invoice_data = invoice_response.json().get('data', {})
+        requests.post(f"{BASE_URL}answerCallbackQuery", json={"callback_query_id": query["id"]})
 
-    if not invoice_data:
-        query.edit_message_text("❌ Failed to create invoice. Try again later.")
-        return ConversationHandler.END
+        if data == "buy":
+            keyboard = {"inline_keyboard": [[{"text": name, "callback_data": f"purchase_{name}"}] for name in PRODUCTS.keys()]}
+            edit_message(chat_id, message_id, "Choose a product:", keyboard)
 
-    address = invoice_data.get('wallet_address')
-    amount = invoice_data.get('amount')
-    invoice_id = invoice_data.get('id')
+        elif data.startswith("purchase_"):
+            product_name = data.split("_")[1]
+            if product_name not in PRODUCTS:
+                edit_message(chat_id, message_id, "Product not found!")
+                return
+            product = PRODUCTS[product_name]
+            variants = product["variants"]
+            if not variants:
+                edit_message(chat_id, message_id, f"No variants available for {product_name}!")
+                return
+            if len(variants) > 1:
+                keyboard = {"inline_keyboard": [[{"text": v["name"], "callback_data": f"variant_{product_name}_{v['id']}"}] for v in variants]}
+                edit_message(chat_id, message_id, f"Choose a variant for {product_name}:", keyboard)
+            else:
+                keyboard = {"inline_keyboard": [[{"text": m, "callback_data": f"pay_{product_name}_{variants[0]['id']}_{m}"}] for m in PAYMENT_METHODS]}
+                edit_message(chat_id, message_id, f"Choose payment method for {product_name} ({variants[0]['name']}):", keyboard)
 
-    context.user_data['invoice_id'] = invoice_id
-    context.user_data['payment_method'] = payment_method
+        elif data.startswith("variant_"):
+            _, product_name, variant_id = data.split("_")
+            if product_name not in PRODUCTS:
+                edit_message(chat_id, message_id, "Product not found!")
+                return
+            keyboard = {"inline_keyboard": [[{"text": m, "callback_data": f"pay_{product_name}_{variant_id}_{m}"}] for m in PAYMENT_METHODS]}
+            variant_name = next((v["name"] for v in PRODUCTS[product_name]["variants"] if str(v["id"]) == variant_id), "Unknown")
+            edit_message(chat_id, message_id, f"Choose payment method for {product_name} ({variant_name}):", keyboard)
 
-    query.edit_message_text(
-        f"Send *{amount}* {payment_method.upper()} to the following address:\n\n`{address}`\n\nAfter payment, reply with your *transaction ID*.",
-        parse_mode="Markdown"
-    )
-    return WAIT_PAYMENT
+        elif data.startswith("pay_"):
+            _, product_name, variant_id, currency = data.split("_")
+            if product_name not in PRODUCTS:
+                edit_message(chat_id, message_id, "Product not found!")
+                return
+            variant_name = next((v["name"] for v in PRODUCTS[product_name]["variants"] if str(v["id"]) == variant_id), "Unknown")
+            PENDING_PURCHASES[user_id] = {"product_name": product_name, "variant_id": variant_id, "currency": currency}
+            send_message(chat_id,
+                         f"Please reply with your email address as we send purchase confirmation on your email as well.\n"
+                         f"Example: `your_email@gmail.com`",
+                         {"force_reply": True})
 
-# === HANDLE TRANSACTION ID ===
-def handle_transaction_id(update, context):
-    txid = update.message.text
-    invoice_id = context.user_data.get('invoice_id')
+def check_sellauth_payment(user_id, product_name, txid):
+    while True:
+        transaction = get_transaction(txid)
+        if transaction and transaction["status"] == "completed":
+            break
+        if check_sellauth_transaction_status(txid):
+            update_transaction_status(txid, "completed")
+            send_message(user_id, f"Payment confirmed for {product_name}! Check your Sellauth account and email for the key.")
+            break
+        time.sleep(60)
 
-    # Confirm invoice with SellAuth
-    confirm_response = requests.post(
-        f"https://api.sellauth.com/v1/shops/{SHOP_ID}/invoices/{invoice_id}/confirm",
-        headers={"Authorization": f"Bearer {SELLAUTH_API_KEY}"},
-        json={"txid": txid}
-    )
-    confirm_data = confirm_response.json().get('data')
+def main():
+    global PRODUCTS
+    try:
+        PRODUCTS = fetch_sellauth_products()
+        print(f"Loaded products: {list(PRODUCTS.keys())}")
+        for name, details in PRODUCTS.items():
+            print(f"  {name}: Variants - {[{k: v for k, v in v.items() if k != 'custom_fields'} for v in details['variants']]}")
+    except Exception as e:
+        print(f"Failed to load products: {e}")
+        PRODUCTS = {}
 
-    if confirm_data and 'serials' in confirm_data and confirm_data['serials']:
-        serial_key = confirm_data['serials'][0]
-        update.message.reply_text(
-            f"✅ Payment confirmed! Here's your serial key:\n\n`{serial_key}`",
-            parse_mode="Markdown"
-        )
-    else:
-        update.message.reply_text("❌ Payment not verified or failed. Please try again or contact support.")
+    offset = None
+    while True:
+        try:
+            url = f"{BASE_URL}getUpdates"
+            params = {"timeout": 30, "offset": offset}
+            response = requests.get(url, params=params, timeout=35)
+            if response.status_code == 200:
+                updates = response.json().get("result", [])
+                for update in updates:
+                    offset = update["update_id"] + 1
+                    handle_update(update)
+            else:
+                print(f"Error fetching updates: {response.text}")
+        except Exception as e:
+            print(f"Polling error: {e}")
+        time.sleep(1)
 
-    return ConversationHandler.END
-
-# === SETUP CONVERSATION HANDLER ===
-conv_handler = ConversationHandler(
-    entry_points=[CommandHandler('start', start)],
-    states={
-        SELECT_PRODUCT: [CallbackQueryHandler(handle_product_selection, pattern='^product_')],
-        SELECT_PAYMENT: [CallbackQueryHandler(handle_payment_selection, pattern='^pay_')],
-        WAIT_PAYMENT: [MessageHandler(Filters.text & ~Filters.command, handle_transaction_id)],
-    },
-    fallbacks=[]
-)
-
-# === FLASK WEBHOOK ENDPOINT ===
-@app.route('/webhook', methods=['POST'])
-def webhook():
-    update = Update.de_json(request.get_json(force=True), bot)
-    dispatcher.process_update(update)
-    return 'ok'
-
-# === REGISTER HANDLER ===
-dispatcher.add_handler(conv_handler)
-
-# === RUN LOCALLY ===
-if __name__ == '__main__':
-    app.run(port=5001)
+if __name__ == "__main__":
+    main()
